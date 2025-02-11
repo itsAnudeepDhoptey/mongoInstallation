@@ -1,0 +1,211 @@
+---
+- name: Setup MongoDB
+  hosts: all
+  become: yes
+  vars:
+    mount_point: "/data"
+    mongodb_version: "6.0.20"
+    mongosh_version: "2.3.9"
+    db_tools_version: "100.9.5"
+    mongodb_user: "mongod"
+    mongodb_group: "mongod"
+
+  tasks:
+    - name: Check if /data directory exists
+      stat:
+        path: "{{ mount_point }}"
+      register: data_dir
+
+    - name: Display block devices if /data does not exist
+      command: lsblk -f
+      register: lsblk_output
+      when: not data_dir.stat.exists
+
+    - name: Show block devices to user
+      debug:
+        var: lsblk_output.stdout_lines
+      when: not data_dir.stat.exists
+
+    - name: Prompt for disk device if /data does not exist
+      pause:
+        prompt: "Enter the disk device to format and mount (e.g., /dev/sdb):"
+      register: user_disk_input
+      when: not data_dir.stat.exists
+
+    - name: Set disk_device variable from user input
+      set_fact:
+        disk_device: "{{ user_disk_input.user_input }}"
+      when: not data_dir.stat.exists
+
+    - name: Create XFS filesystem on the disk
+      filesystem:
+        fstype: xfs
+        dev: "{{ disk_device }}"
+      when: not data_dir.stat.exists
+
+    - name: Create mount point directory
+      file:
+        path: "{{ mount_point }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when: not data_dir.stat.exists
+
+    - name: Mount the disk
+      mount:
+        path: "{{ mount_point }}"
+        src: "{{ disk_device }}"
+        fstype: xfs
+        state: mounted
+      when: not data_dir.stat.exists
+
+    - name: Ensure the mount persists on reboot
+      mount:
+        path: "{{ mount_point }}"
+        src: "{{ disk_device }}"
+        fstype: xfs
+        opts: defaults
+        state: present
+      when: not data_dir.stat.exists
+
+    - name: Create necessary directories under /data
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ mount_point }}/tools"
+        - "{{ mount_point }}/tools/repository"
+        - "{{ mount_point }}/mongodb"
+        - "{{ mount_point }}/mongodb/config"
+        - "{{ mount_point }}/mongodb/data"
+        - "{{ mount_point }}/mongodb/init"
+        - "{{ mount_point }}/mongodb/logs"
+
+    - name: Download MongoDB and tools
+      get_url:
+        url: "{{ item.url }}"
+        dest: "{{ mount_point }}/tools/repository/{{ item.dest }}"
+      loop:
+        - { url: "https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-rhel8-{{ mongodb_version }}.tgz", dest: "mongodb-linux-x86_64-rhel8-{{ mongodb_version }}.tgz" }
+        - { url: "https://downloads.mongodb.com/compass/mongosh-{{ mongosh_version }}-linux-x64.tgz", dest: "mongosh-{{ mongosh_version }}-linux-x64.tgz" }
+        - { url: "https://fastdl.mongodb.org/tools/db/mongodb-database-tools-rhel80-x86_64-{{ db_tools_version }}.tgz", dest: "mongodb-database-tools-rhel80-x86_64-{{ db_tools_version }}.tgz" }
+
+    - name: Extract MongoDB and tools
+      unarchive:
+        src: "{{ item }}"
+        dest: "{{ mount_point }}/tools/repository"
+        remote_src: yes
+      loop:
+        - "{{ mount_point }}/tools/repository/mongodb-linux-x86_64-rhel8-{{ mongodb_version }}.tgz"
+        - "{{ mount_point }}/tools/repository/mongosh-{{ mongosh_version }}-linux-x64.tgz"
+        - "{{ mount_point }}/tools/repository/mongodb-database-tools-rhel80-x86_64-{{ db_tools_version }}.tgz"
+
+    - name: Move binaries to /usr/bin
+      shell: |
+        mv {{ mount_point }}/tools/repository/*/bin/* /usr/bin/
+
+    - name: Change ownership of /data to mongod
+      file:
+        path: "{{ mount_point }}"
+        state: directory
+        recurse: yes
+        owner: "{{ mongodb_user }}"
+        group: "{{ mongodb_group }}"
+
+    - name: Retrieve eth0 IP address
+      command: ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}'
+      register: eth0_ip
+
+    - name: Create MongoDB config file
+      copy:
+        dest: "{{ mount_point }}/mongodb/config/mongod.conf"
+        content: |
+          systemLog:
+            destination: file
+            logAppend: true
+            path: /mongodb_logs/logs/mongod.log
+            logRotate: reopen
+
+          storage:
+            dbPath: /data/mongodb/data
+            journal:
+              enabled: true
+
+          processManagement:
+            fork: true
+            pidFilePath: /data/mongodb/init/mongod.pid
+            timeZoneInfo: /usr/share/zoneinfo
+
+          net:
+            port: 27017
+            bindIp: {{ eth0_ip.stdout }},127.0.0.1
+
+          replication:
+            replSetName: prod_jcms
+
+          security:
+            authorization: enabled
+            keyFile: /data/mongodb/config/mongodb-keyfile
+
+    - name: Generate MongoDB keyfile
+      shell: openssl rand -base64 768 > {{ mount_point }}/mongodb/config/mongodb-keyfile
+
+    - name: Set permissions for MongoDB keyfile
+      file:
+        path: "{{ mount_point }}/mongodb/config/mongodb-keyfile"
+        owner: "{{ mongodb_user }}"
+        group: "{{ mongodb_group }}"
+        mode: '0400'
+
+    - name: Copy MongoDB keyfile to other VMs
+      copy:
+        src: "{{ mount_point }}/mongodb/config/mongodb-keyfile"
+        dest: "{{ mount_point }}/mongodb/config/mongodb-keyfile"
+        owner: "{{ mongodb_user }}"
+        group: "{{ mongodb_group }}"
+        mode: '0400'
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['all'] | difference([inventory_hostname]) }}"
+
+    - name: Create MongoDB service file
+      copy:
+        dest: /etc/systemd/system/mongod.service
+        content: |
+          [Unit]
+          Description=MongoDB Database Server
+          Documentation=https://docs.mongodb.org/manual
+          After=network.target
+
+          [Service]
+          User=mongod
+          Group=mongod
+          Environment="OPTIONS=-f /data/mongodb/config/mongod.conf"
+          EnvironmentFile=-/etc/sysconfig/mongod
+          ExecStart=/usr/bin/mongod $OPTIONS
+          PermissionsStartOnly=true
+          PIDFile=/data/mongodb/init/mongod.pid
+          Type=forking
+          LimitFSIZE=infinity
+          LimitCPU=infinity
+          LimitAS=infinity
+          LimitNOFILE=64000
+          LimitNPROC=64000
+          LimitMEMLOCK=infinity
+          TasksMax=infinity
+          TasksAccounting=false
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd and enable MongoDB service
+      systemd:
+        daemon_reload: yes
+        enabled: yes
+        name: mongod.service
+
+    - name: Start MongoDB service
+      systemd:
+        name: mongod.service
+        state: started
